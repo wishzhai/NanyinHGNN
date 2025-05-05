@@ -1,0 +1,395 @@
+# 南音增强模型两阶段训练配置 - 装饰音优化版
+# 本配置文件已经优化解决以下问题：
+# 1. 移除了重复和冲突的stage2定义
+# 2. 统一了各阶段的loss权重结构
+# 3. 调整了装饰音生成规则，优化二度音程和均匀分布
+# 4. 降低了自监督学习的相关参数以防止过拟合
+# 5. 调整了学习率和早停参数以提高训练稳定性
+
+# 从 model_light.yaml 复制基本配置
+# 添加两阶段训练的特定配置
+
+# 输出目录配置
+output_dir:
+  stage1: "logs/enhanced_two_stage/stage1"
+  stage2: "logs/enhanced_two_stage/stage2"
+
+# 规则注入配置
+rule_injection:
+  special_note_boost: 1.4     # 进一步提高特色音提升强度
+  pentatonic_boost: 1.2       # 进一步提高五声音阶提升强度
+  base_decorate_weight: 0.5   # 增加装饰权重
+  ornament_density: 0.35      # 降低密度至更合理范围
+  enable_ornaments: true     
+  min_note_duration: 0.2      # 进一步降低阈值
+  special_notes:             
+    '#f': 54                 
+    '#c1': 61                
+    '#f1': 66                
+
+# 装饰音处理配置
+ornament_styles:
+  standard:  # 标准装饰音
+    enabled: true
+    type: "standard"
+    description: "标准装饰音处理"
+    duration_factor: 0.3      # 增加持续时间
+    velocity_factor: 0.9      # 增加力度
+    position_shift: 0.015     # 减小位置偏移
+    pitch_intervals: [2]      # 只使用二度音程，提高合理性
+    min_duration: 0.15        # 增加最小持续时间
+    max_duration: 0.35        # 缩小最大持续时间
+    probability: 0.5          # 降低概率
+    context_window: 6         # 增加上下文窗口
+    rules:
+      - condition: "before_long_note"   
+        duration_factor: 0.25  # 减小长音前的时值
+        velocity_factor: 0.85  # 增加力度
+      - condition: "phrase_beginning"   
+        duration_factor: 0.3   # 增加乐句开始的时值
+        velocity_factor: 0.95  # 增加力度
+  
+  light_appoggiatura:  # 轻短倚音
+    enabled: true
+    type: "appoggiatura"
+    description: "轻短倚音型装饰音"
+    duration_factor: 0.2
+    velocity_factor: 0.8      # 增加力度
+    position_shift: 0.01      # 减小位置偏移
+    pitch_intervals: [2]      # 只使用二度音程
+    min_duration: 0.1
+    max_duration: 0.2         # 减小最大时值
+    probability: 0.6          # 降低概率
+    direction: "up"           # 保持上行
+  
+  melodic_integration:  # 旋律融合型
+    enabled: true
+    type: "melodic"
+    description: "与旋律融合的装饰音"
+    duration_factor: 0.3      # 减小时值因子
+    velocity_factor: 0.9      # 增加力度
+    position_shift: 0.015     # 减小位置偏移
+    pitch_intervals: [2]      # 只使用二度音程
+    min_duration: 0.15        # 减小最小时值
+    max_duration: 0.4         # 减小最大时值
+    probability: 0.4          # 降低概率
+    context_window: 6         # 增加上下文窗口
+
+ornament_global:
+  min_interval: 3             # 增加最小间隔
+  max_consecutive: 1          # 减少连续装饰音
+  ornament_probability: 0.4   # 降低全局装饰音概率
+
+model:
+  hidden_dim: 256             # 减小隐藏层维度
+  num_heads: 4                # 减少注意力头数
+  num_layers: 3               # 减少层数
+  dropout: 0.15               # 增加dropout
+  feature_enhancer:
+    enabled: true
+    multi_scale_dims: [16, 32, 64]  # 减小多尺度维度
+    fusion_dim: 64            # 减小融合维度
+    context_layers: 1         # 减少上下文层数
+    dropout: 0.1
+  pitch_decoder:
+    hidden_dim: 256           # 减小隐藏层维度
+    num_heads: 4              # 减少注意力头数
+    label_smoothing: 0.15     # 增加标签平滑
+    pitch_smoothness_weight: 0.3
+    pitch_range_weight: 0.2
+  loss_weights:
+    pitch: 1.0
+    pitch_smoothness: 0.5     # 增加平滑度权重
+    pitch_range: 0.3          # 增加音域权重
+    self_supervised: 0.4      # 适当降低自监督权重
+  graph_lora:
+    enabled: false            # 禁用图LoRA
+
+# 第一阶段：基本特征训练
+stage1:
+  enabled: true
+  max_epochs: 120
+  early_stopping:
+    monitor: 'epoch_val_loss'
+    patience: 35
+    min_delta: 0.0003
+    mode: 'min'
+    check_finite: true
+    verbose: true
+    check_on_train_epoch_end: false
+    stopping_threshold: 0.8
+  lora:
+    enabled: true
+    rank: 6
+    alpha: 24
+    dropout: 0.1
+    target_modules:
+      - "pitch_predictor.gnn_layers"
+      - "pitch_predictor.attention_layers"
+      - "pitch_predictor.feed_forward"
+      - "feature_projection"
+  train:
+    learning_rate: 0.0003
+    batch_size: 8
+    gradient_clip_val: 1.0
+    accumulate_grad_batches: 2
+    warmup_steps: 150
+    loss_weights:
+      pitch: 1.0
+      pitch_smoothness: 0.3
+      pitch_range: 0.2
+      self_supervised: 0.3
+      duration: 0.7
+      velocity: 0.7
+      reconstruction: 0.0  # 第一阶段不使用重建损失
+      contrastive: 0.0     # 第一阶段不使用对比损失
+    lr_scheduler:
+      name: "CosineAnnealingWarmRestarts"
+      T_0: 20
+      T_mult: 2
+      eta_min: 0.00002
+  
+# 第二阶段：装饰音训练
+stage2:
+  enabled: true
+  name: "stage2"
+  description: "第二阶段 - 装饰音训练"
+  max_epochs: 30              # 增加训练轮数
+  early_stopping:
+    monitor: 'val_loss'
+    patience: 20              # 大幅增加耐心值
+    min_delta: 0.0005         # 减小改善阈值
+    mode: 'min'
+  lora:
+    enabled: false            # 禁用LoRA微调以减少不稳定性
+  train:
+    learning_rate: 0.00002    # 大幅降低学习率
+    batch_size: 4             # 减小批次大小
+    gradient_clip_val: 0.5    # 减小梯度裁剪阈值
+    accumulate_grad_batches: 8 # 增加梯度累积步数
+    warmup_steps: 400         # 大幅增加预热步数
+    
+    lr_scheduler:
+      name: "CosineAnnealingWarmRestarts"
+      T_0: 5                  # 减少周期长度
+      T_mult: 1               # 不增加周期
+      eta_min: 0.000001       # 降低最小学习率
+    
+    # 调整损失权重以接近目标指标
+    loss_weights:
+      pitch: 1.0
+      pitch_smoothness: 0.35  # 增加平滑度权重提高F1
+      pitch_range: 0.25       # 增加音域权重提高F1
+      self_supervised: 0.4    # 降低自监督学习权重改善Nianzhi Loss
+      duration: 0.4           # 增加时值权重以稳定学习
+      velocity: 0.4           # 增加力度权重以稳定学习
+      reconstruction: 0.1     # 降低重建损失权重
+      contrastive: 0.05       # 降低对比损失权重
+  
+  # 装饰音规则评估配置
+  ornament_evaluation:
+    enabled: true
+    metrics:
+      - ornament_density      # 装饰音密度
+      - ornament_coverage     # 装饰音覆盖率
+      - ornament_evenness     # 装饰音分布均匀性
+      - ornament_type_diversity  # 装饰音类型多样性
+      - avg_ornament_interval    # 平均装饰音音程
+      - second_interval_ratio    # 二度装饰音比例
+      - third_interval_ratio     # 三度装饰音比例
+    
+    # 装饰音类型定义
+    types:
+      - name: "前导装饰音"
+        id: 0
+      - name: "后倚装饰音"
+        id: 1
+      - name: "结尾装饰音"
+        id: 2
+    
+    # 装饰音规则参数
+    rule_params:
+      min_density: 0.2        # 最小装饰音密度
+      max_density: 0.6        # 最大装饰音密度
+      target_coverage: 0.7    # 目标装饰音覆盖率
+      target_evenness: 0.8    # 目标装饰音分布均匀性
+      preferred_intervals: [2, 3]  # 优先使用的音程，限制在二度和三度
+
+# 通用训练配置（用于初始化，各阶段可覆盖）
+train_base:
+  max_epochs: 80  # 总训练轮数
+  learning_rate: 0.0001
+  batch_size: 4
+  steps_per_epoch: 100
+  early_stopping_patience: 10
+  val_interval: 1
+  precision: "16-mixed"  # 使用混合精度训练
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 2
+  warmup_steps: 100
+  loss_weights:
+    pitch: 1.0
+    duration: 1.0
+    velocity: 1.0
+    pitch_smoothness: 0.2
+    pitch_range: 0.1
+    self_supervised: 0.5
+
+# 优化器配置
+optimizer:
+  type: "AdamW"
+  learning_rate: 0.0005              # 降低基础学习率
+  weight_decay: 0.001                # 增加权重衰减
+  beta1: 0.9
+  beta2: 0.95                        # 调整beta2
+  eps: 1.0e-6                        # 增加epsilon
+  scheduler:
+    name: "cosine"
+    T_max: 20                        # 减少周期
+    eta_min: 0.000005                # 调整最小学习率
+
+# 数据增强配置
+data_augmentation:
+  enabled: true
+  pitch_shift_range: [-2, 2]        # 缩小音高变化范围
+  time_stretch_range: [0.95, 1.05]  # 缩小时间伸缩范围
+  velocity_shift_range: [-5, 5]     # 缩小力度变化范围
+  random_crop_prob: 0.2             # 减少随机裁剪概率
+  random_crop_length: 12            # 减小裁剪长度
+  # 简化数据增强方法
+  random_swap_prob: 0.08            # 减少随机交换音符的概率
+  random_drop_prob: 0.05            # 减少随机丢弃音符的概率
+  noise_addition:
+    enabled: false                   # 禁用噪声添加
+  feature_masking:
+    enabled: true
+    prob: 0.15                       # 减少特征遮蔽概率
+    mask_ratio: 0.1                  # 减少遮蔽比例
+
+# 自监督学习配置
+self_supervised:
+  enabled: true
+  dropout: 0.08               # 减小dropout
+  loss_weight: 0.4            # 降低总体权重
+  nianzhi:
+    enabled: true
+    positive_weight: 2.0      # 降低正样本权重
+    loss:
+      position_weight: 0.35   # 降低位置预测权重
+      speed_weight: 0.25      # 增加速度预测权重
+      intensity_weight: 0.15  # 降低强度预测权重
+      contrastive_weight: 0.05 # 降低对比权重
+      focal_loss:
+        alpha: 0.6            # 降低alpha值
+        gamma: 1.0            # 降低gamma值
+      temperature: 0.4        # 降低temperature
+  training:
+    curriculum:
+      enabled: false          # 保持禁用课程学习
+
+# tokenizer配置
+tokenizer:
+  ticks_per_quarter: 480
+  num_velocities: 32
+  num_microtiming_bins: 8
+  beat_res:
+    "(0, 4)": 8
+    "(4, 12)": 4
+  nanyin_pitches:
+    "50": "d"   # D3 (小字组D)
+    "52": "e"   # E3 (小字组E)
+    "53": "f"   # F3 (小字组F)
+    "54": "#f"  # F#3 (小字组F#)
+    "55": "g"   # G3 (小字组G)
+    "57": "a"   # A3 (小字组A)
+    "59": "b"   # B3 (小字组B)
+    "60": "c1"  # C4 (小字一组C)
+    "61": "#c1" # C#4 (小字一组C#)
+    "62": "d1"  # D4 (小字一组D)
+    "64": "e1"  # E4 (小字一组E)
+    "65": "f1"  # F4 (小字一组F)
+    "66": "#f1" # F#4 (小字一组F#)
+    "67": "g1"  # G4 (小字一组G)
+    "69": "a1"  # A4 (小字一组A)
+    "70": "bb1" # Bb4 (小字一组Bb)
+    "71": "b1"  # B4 (小字一组B)
+    "72": "c2"  # C5 (小字二组C)
+    "74": "d2"  # D5 (小字二组D)
+    "76": "e2"  # E5 (小字二组E)
+    "79": "g2"  # G5 (小字二组G)
+    "81": "a2"  # A5 (小字二组A)
+    "83": "b2"  # B5 (小字二组B)
+
+# 南音调式定义
+MODES:
+  TRADITIONAL:
+    "宫": 0
+    "商": 1
+    "角": 2
+    "徵": 3
+    "羽": 4
+    "变徵": 5
+    "变宫": 6
+  INSTRUMENTS:
+    WUKONG:
+      name: "五空管"
+      upper_register: [62, 64, 67, 69, 71, 74, 76, 79, 81, 83]  # d1-b2
+      lower_register: [50, 52, 55, 57, 60, 62, 64, 67, 69]  # d-a1
+    SIKONG:
+      name: "四空管"
+      scale: [50, 53, 55, 57, 60, 62, 65, 67, 69, 72, 74, 76, 79, 81]  # d-a2
+    WUKONG_SIYI:
+      name: "五空四仪管"
+      scale: [50, 52, 55, 57, 60, 62, 64, 67, 69, 72, 74, 76, 79, 81]  # d-a2
+    BEISI:
+      name: "倍四管"
+      scale: [50, 52, 53, 57, 59, 62, 64, 66, 69, 71, 74, 76]  # d-e2
+
+# 回调函数配置
+callbacks:
+  early_stopping:
+    monitor: "val_loss"
+    patience: 18              # 从15增加到18，提供更长的训练时间
+    min_delta: 0.0005        # 保持相同的改善阈值
+    mode: "min"
+    
+  model_checkpoint:
+    monitor: "val_loss"
+    save_top_k: 5            # 保持相同的保存数量
+    mode: "min"
+    
+  learning_rate_monitor:
+    logging_interval: "step"
+
+# 通用配置
+model_name: "enhanced_nanyin"
+seed: 42
+precision: "16-mixed"  # 使用混合精度训练
+
+# 数据配置
+data:
+  batch_size: 32
+  num_workers: 4
+  train_data_dir: "data/train"
+  val_data_dir: "data/val"
+  test_data_dir: "data/test"
+
+# 学习率调度器配置
+lr_scheduler:
+  name: "CosineAnnealingLR"
+  T_max: 50
+  eta_min: 1e-6
+
+# 南音装饰音规则参数
+ornament_rules:
+  enable: true
+  basic:
+    intervals: [2]            # 只保留二度音程
+    second_interval_weight: 0.9  # 提高二度音程权重
+    upper_direction_weight: 0.7  # 提高上行音程权重
+    min_note_duration: 0.2       # 降低最小主音时值要求
+  placement:
+    before_long_note: true        
+    phrase_beginning: true        
+    avoid_phrase_end: true        
+    max_density: 0.5              # 降低最大密度限制

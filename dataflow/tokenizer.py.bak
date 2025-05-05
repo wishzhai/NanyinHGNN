@@ -1,0 +1,873 @@
+from miditok import MusicTokenizer, TokenizerConfig   
+from symusic import Score, Note, Track
+import torch
+import os
+from pathlib import Path
+import numpy as np
+from typing import List, Tuple, Dict, Optional
+import dgl
+from tqdm import tqdm
+import json
+
+class NanyinTokenizerConfig(TokenizerConfig):
+    """南音分词器配置"""
+    def __init__(self, beat_res, num_velocities, num_microtiming_bins):
+        # 调用父类初始化
+        super().__init__(
+            pitch_range=(21, 109),  # 标准MIDI音高范围
+            beat_res=beat_res,
+            num_velocities=num_velocities,
+            special_tokens=["PAD", "BOS", "EOS", "MASK"],
+            encode_ids_split="bar",
+            use_velocities=True,
+            use_note_duration_programs=list(range(-1, 128)),  # 所有程序都使用持续时间
+            use_chords=False,
+            use_rests=False,
+            use_tempos=True,
+            use_time_signatures=True,
+            use_sustain_pedals=False,
+            use_pitch_bends=False,
+            use_pitch_intervals=False,
+            use_programs=False,
+            use_pitchdrum_tokens=True,
+            default_note_duration=0.5,
+            beat_res_rest={(0, 1): 8, (1, 2): 4, (2, 12): 2},
+            chord_maps=None,
+            chord_tokens_with_root_note=False,
+            chord_unknown=None,
+            num_tempos=32,
+            tempo_range=(40, 250),
+            log_tempos=False,
+            remove_duplicated_notes=False,
+            delete_equal_successive_tempo_changes=False,
+            time_signature_range={8: [3, 12, 6], 4: [5, 6, 3, 2, 1, 4]},
+            sustain_pedal_duration=False,
+            pitch_bend_range=(-8192, 8191, 32),
+            delete_equal_successive_time_sig_changes=False,
+            programs=list(range(-1, 128)),
+            one_token_stream_for_programs=True,
+            program_changes=False,
+            max_pitch_interval=16,
+            pitch_intervals_max_time_dist=1,
+            drums_pitch_range=(27, 88)
+        )
+        
+        # 保存南音特有的配置
+        self.num_microtiming_bins = num_microtiming_bins
+        
+    @property
+    def max_num_pos_per_beat(self) -> int:
+        """返回每拍的最大位置数"""
+        return max(self.beat_res.values())
+        
+    def copy(self) -> 'NanyinTokenizerConfig':
+        """复制配置对象"""
+        return NanyinTokenizerConfig(
+            beat_res=self.beat_res.copy(),
+            num_velocities=self.num_velocities,
+            num_microtiming_bins=self.num_microtiming_bins
+        )
+        
+    def to_dict(self, serialize: bool = False) -> dict:
+        """序列化为字典"""
+        base_dict = super().to_dict(serialize)
+        base_dict.update({
+            'num_microtiming_bins': self.num_microtiming_bins
+        })
+        return base_dict
+        
+    @classmethod
+    def from_dict(cls, input_dict: dict, **kwargs) -> 'NanyinTokenizerConfig':
+        """从字典创建配置对象"""
+        config = cls(
+            beat_res=input_dict.get('beat_res', {(0, 4): 8, (4, 12): 4}),
+            num_velocities=input_dict.get('num_velocities', 32),
+            num_microtiming_bins=input_dict.get('num_microtiming_bins', 8)
+        )
+        return config
+
+class NanyinTok(MusicTokenizer):
+    # 将NANYIN_PITCHES定义为类变量，正确映射南音音高
+    NANYIN_PITCHES = {
+        50: "d",   # D3 (小字组D)
+        52: "e",   # E3 (小字组E)
+        53: "f",   # F3 (小字组F)
+        54: "#f",  # F#3 (小字组F#)
+        55: "g",   # G3 (小字组G)
+        57: "a",   # A3 (小字组A)
+        59: "b",   # B3 (小字组B)
+        60: "c1",  # C4 (小字一组C)
+        61: "#c1", # C#4 (小字一组C#)
+        62: "d1",  # D4 (小字一组D)
+        64: "e1",  # E4 (小字一组E)
+        65: "f1",  # F4 (小字一组F)
+        66: "#f1", # F#4 (小字一组F#)
+        67: "g1",  # G4 (小字一组G)
+        69: "a1",  # A4 (小字一组A)
+        70: "bb1", # Bb4 (小字一组Bb)
+        71: "b1",  # B4 (小字一组B)
+        72: "c2",  # C5 (小字二组C)
+        74: "d2",  # D5 (小字二组D)
+        76: "e2",  # E5 (小字二组E)
+        79: "g2",  # G5 (小字二组G)
+        81: "a2",  # A5 (小字二组A)
+        83: "b2"   # B5 (小字二组B)
+    }
+    
+    # 将MODES定义为类变量
+    MODES = {
+        "WUKONG": {
+            "name": "五空管",
+            "upper_register": set([62, 64, 67, 69, 71, 74, 76, 79, 81, 83]),  # d1-b2
+            "lower_register": set([50, 52, 55, 57, 60, 62, 64, 67, 69])  # d-a1
+        },
+        "SIKONG": {
+            "name": "四空管",
+            "scale": set([50, 53, 55, 57, 60, 62, 65, 67, 69, 72, 74, 76, 79, 81])  # d-a2
+        },
+        "WUKONG_SIYI": {
+            "name": "五空四仪管",
+            "scale": set([50, 52, 55, 57, 60, 62, 64, 67, 69, 72, 74, 76, 79, 81])  # d-a2
+        },
+        "BEISI": {
+            "name": "倍四管",
+            "scale": set([50, 52, 53, 57, 59, 62, 64, 66, 69, 71, 74, 76])  # d-e2
+        }
+    }
+
+    def __init__(self, config: dict):
+        """初始化tokenizer
+        Args:
+            config: 配置字典
+        """
+        print("初始化tokenizer...")
+        
+        # 从配置中读取tokenizer参数
+        self.tokenizer_config = config.get('tokenizer', {})
+        
+        # 修正beat_res的格式
+        beat_res_config = self.tokenizer_config.get('beat_res', {})
+        self.beat_res = {(0, 4): 16}  # 默认值
+        if isinstance(beat_res_config, dict):
+            for k, v in beat_res_config.items():
+                if isinstance(k, str) and k.startswith('(') and k.endswith(')'):
+                    try:
+                        nums = k.strip('()').split(',')
+                        key = (int(nums[0]), int(nums[1]))
+                        self.beat_res[key] = v
+                    except:
+                        print(f"警告：无法解析beat_res键 {k}，使用默认值")
+        
+        self.ticks_per_quarter = self.tokenizer_config.get('ticks_per_quarter', 480)
+        self.num_velocities = self.tokenizer_config.get('num_velocities', 32)
+        self.num_microtiming_bins = self.tokenizer_config.get('num_microtiming_bins', 8)
+        
+        print(f"配置信息:")
+        print(f"- ticks_per_quarter: {self.ticks_per_quarter}")
+        print(f"- num_velocities: {self.num_velocities}")
+        print(f"- beat_res: {self.beat_res}")
+        
+        # 先创建词汇表
+        self._vocab = self._create_base_vocabulary()
+        print(f"词汇表初始化完成:")
+        print(f"- 总token数量: {len(self._vocab)}")
+        print(f"- 包含的特殊token: {[k for k in self._vocab.keys() if k.startswith('Pitch_')][:5]}")
+        
+        # 创建配置对象
+        config_obj = TokenizerConfig(
+            pitch_range=(21, 109),  # 标准MIDI音高范围
+            beat_res=self.beat_res,
+            num_velocities=self.num_velocities,
+            special_tokens=["PAD", "BOS", "EOS", "MASK"],
+            encode_ids_split="bar",
+            use_velocities=True,
+            use_tempos=True,
+            use_time_signatures=True,
+            use_programs=False
+        )
+        
+        # 初始化父类
+        try:
+            super().__init__(config_obj)
+            self.config = config
+        except Exception as e:
+            print(f"Tokenizer初始化出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def _create_base_vocabulary(self) -> Dict[str, int]:
+        """创建基础词汇表
+        Returns:
+            Dict[str, int]: 基础词汇表
+        """
+        vocab = {}
+        current_index = 0
+        
+        # 特殊标记
+        special_tokens = ["PAD", "BOS", "EOS", "MASK", "UNK"]
+        for token in special_tokens:
+            vocab[token] = current_index
+            current_index += 1
+        
+        # 音高词汇表
+        pitch_names = ["UNK"] + list(set(self.NANYIN_PITCHES.values()))
+        for pitch_name in pitch_names:
+            vocab[f"Pitch_{pitch_name}"] = current_index
+            current_index += 1
+        
+        # 时值词汇表
+        for i in range(128):
+            vocab[f"TimeShift_{i}"] = current_index
+            current_index += 1
+        
+        # 力度词汇表
+        for i in range(self.num_velocities):
+            vocab[f"Velocity_{i}"] = current_index
+            current_index += 1
+        
+        # 持续时间词汇表
+        for i in range(128):
+            vocab[f"Duration_{i}"] = current_index
+            current_index += 1
+        
+        # 技法词汇表
+        tech_types = ["None", "Nianzhi", "Diantiao"]
+        for tech in tech_types:
+            vocab[f"Tech_{tech}"] = current_index
+            current_index += 1
+            
+        return vocab
+
+    @property
+    def vocab(self):
+        """获取词汇表"""
+        return self._vocab
+
+    def _create_token_types_graph(self) -> Dict[str, set]:
+        """创建token类型转换图
+        Returns:
+            Dict[str, set]: token类型转换图，使用集合存储可能的下一个类型
+        """
+        return {
+            "Bar": {"TimeShift", "Pitch"},
+            "TimeShift": {"Pitch"},
+            "Pitch": {"Velocity", "Duration"},
+            "Velocity": {"MicroTiming", "Duration"},
+            "MicroTiming": {"Duration", "Tech_Nianzhi"},
+            "Duration": {"TimeShift", "Pitch", "Tech_Nianzhi"},
+            "Tech_Nianzhi": {"TimeShift", "Pitch"}
+        }
+
+    def _detect_nianzhi(self, notes: List[Note]) -> bool:
+        """检测撚指 - 重复音符序列
+        Args:
+            notes: 音符列表
+        Returns:
+            bool: 是否为撚指
+        """
+        # 基本验证
+        if len(notes) < 3:  # 撚指至少需要3个音符
+            return False
+        
+        # 1. 检查音高一致性 - 撚指是相同音高的连续音符
+        if not all(note.pitch == notes[0].pitch for note in notes):
+            return False
+        
+        # 2. 检查时间间隔 - 撚指的音符间隔较短
+        intervals = [notes[i+1].start - notes[i].start for i in range(len(notes)-1)]
+        max_interval = self.ticks_per_quarter * 0.5  # 最大间隔为半拍
+        if max(intervals) >= max_interval:
+            return False
+        
+        # 3. 检查持续时间 - 撚指的音符通常较短
+        if max(note.duration for note in notes) >= self.ticks_per_quarter:  # 持续时间不超过一拍
+            return False
+            
+        # 4. 检查间隔递减 - 由慢到快特征
+        # 如果有足够多的音符，检查间隔是否有递减趋势
+        if len(notes) >= 4:
+            # 计算相邻间隔的比率，检查是否大部分呈递减趋势
+            decreasing_count = sum(1 for i in range(len(intervals)-1) if intervals[i+1] <= intervals[i])
+            # 如果大部分间隔在递减，这是撚指的特征之一
+            if decreasing_count >= len(intervals) * 0.6:
+                return True
+        
+        # 5. 基本检查
+        # 如果音符数量较少或无法确定递减趋势，但其他条件都满足，依然可能是撚指
+        return True
+
+    def _add_time_events(self, track: Track) -> List[Dict]:
+        """添加时间相关事件
+        Args:
+            track: 音轨对象
+        Returns:
+            List[Dict]: 时间事件列表
+        """
+        events = []
+        current_time = 0
+        
+        for note in sorted(track.notes, key=lambda x: x.start):
+            # 计算时值
+            time_shift = note.start - current_time
+            if time_shift > 0:
+                # 将时值转换为拍数，并使用掩码处理超出范围的值
+                beats = time_shift / self.ticks_per_quarter
+                quantized_beats = min(127, int(beats * self.beat_res[(0, 4)]))
+                events.append({"type": "TimeShift", "value": quantized_beats})
+                
+                # 处理微时值
+                micro_shift = time_shift % self.ticks_per_quarter
+                if micro_shift > 0:
+                    micro_bin = min(self.num_microtiming_bins - 1, 
+                                  int(micro_shift * self.num_microtiming_bins / self.ticks_per_quarter))
+                    events.append({"type": "MicroTiming", "value": micro_bin})
+            
+            current_time = note.start
+            
+        return events
+
+    def _tokens_to_score(self, tokens: List[int]) -> Score:
+        """将tokens转换回Score对象"""
+        score = Score(ticks_per_quarter=self.ticks_per_quarter)
+        track = Track()
+        
+        current_time = 0
+        current_pitch = None
+        current_velocity = None
+        is_nianzhi = False
+        nianzhi_notes = []
+        
+        for token in tokens:
+            token_str = self.vocab[token]
+            
+            if token_str == "Tech_Nianzhi":
+                is_nianzhi = True
+                continue
+                
+            if token_str.startswith("Pitch_"):
+                current_pitch = int(token_str.split("_")[1])
+            elif token_str.startswith("Velocity_"):
+                current_velocity = int(token_str.split("_")[1])
+            elif token_str.startswith("Duration_"):
+                duration = int(token_str.split("_")[1]) * self.ticks_per_quarter
+                if current_pitch is not None and current_velocity is not None:
+                    note = Note(
+                        start=current_time,
+                        end=current_time + duration,
+                        pitch=current_pitch,
+                        velocity=current_velocity
+                    )
+                    
+                    if is_nianzhi:
+                        nianzhi_notes.append(note)
+                        if len(nianzhi_notes) >= 3:  # 修改为至少3个音符
+                            for n in nianzhi_notes:
+                                track.notes.append(n)
+                            nianzhi_notes = []
+                            is_nianzhi = False
+                    else:
+                        track.notes.append(note)
+                        
+            elif token_str.startswith("TimeShift_"):
+                current_time += int(token_str.split("_")[1]) * self.ticks_per_quarter
+                
+        score.tracks.append(track)
+        return score
+
+    def _score_to_tokens(self, score: Score) -> List[int]:
+        """将Score对象转换为tokens，使用掩码处理超出范围的值"""
+        tokens = []
+        notes_window = []
+        is_nianzhi = False
+        current_time = 0
+        
+        try:
+            for track in score.tracks:
+                if not track.notes:
+                    continue
+                
+                for note in sorted(track.notes, key=lambda x: x.start):
+                    # 添加时间事件
+                    time_shift = note.start - current_time
+                    if time_shift > 0:
+                        beats = time_shift / self.ticks_per_quarter
+                        quantized_beats = min(127, max(0, int(beats * self.beat_res[(0, 4)])))
+                        time_token = self.vocab.get(f"TimeShift_{quantized_beats}", self.vocab["TimeShift_0"])
+                        tokens.append(time_token)
+                    
+                    # 处理音高 - 使用掩码处理超出范围的音高
+                    pitch_name = self.NANYIN_PITCHES.get(note.pitch)
+                    if pitch_name:
+                        tokens.append(self.vocab[f"Pitch_{pitch_name}"])
+                    else:
+                        tokens.append(self.vocab["Pitch_UNK"])  # 使用UNK作为掩码
+                    
+                    # 处理力度 - 使用掩码处理超出范围的力度
+                    velocity_bin = min(self.num_velocities - 1, 
+                                     int(note.velocity * self.num_velocities / 128))
+                    tokens.append(self.vocab[f"Velocity_{velocity_bin}"])
+                    
+                    # 处理时长 - 使用掩码处理超出范围的时长
+                    duration_beats = note.duration / self.ticks_per_quarter
+                    quantized_duration = min(127, int(duration_beats * self.beat_res[(0, 4)]))
+                    tokens.append(self.vocab[f"Duration_{quantized_duration}"])
+                    
+                    current_time = note.start
+                    
+                    # 更新滑动窗口
+                    notes_window.append(note)
+                    if len(notes_window) > 15:
+                        notes_window.pop(0)
+                    
+                    # 检测撚指
+                    if len(notes_window) >= 3 and self._detect_nianzhi(notes_window):
+                        if not is_nianzhi:
+                            is_nianzhi = True
+                            tokens.append(self.vocab["Tech_Nianzhi"])
+                    else:
+                        is_nianzhi = False
+            
+            return tokens
+            
+        except Exception as e:
+            print(f"转换tokens时出错: {str(e)}")
+            # 返回最小有效的token序列
+            return [
+                self.vocab["Pitch_UNK"],
+                self.vocab["Velocity_0"],
+                self.vocab["Duration_0"]
+            ]
+
+    def _get_mode_mask(self, notes: List[Note], mode: str) -> List[bool]:
+        """
+        Args:
+            notes: 音符列表
+            mode: 调式名称
+            
+        Returns:
+            List[bool]: 模式掩码，True表示音符在调式内，False表示在调式外
+        """
+        if mode not in self.MODES:
+            return [False] * len(notes)
+
+        mode_scale = self.MODES[mode]["scale"]
+        return [note.pitch in mode_scale for note in notes]
+
+    def _tokenize_with_mode_mask(self, notes: List[Note], mode: str) -> Tuple[List[int], List[bool]]:
+        """带有模式掩码的tokenization
+        
+        Args:
+            notes: 音符列表
+            mode: 调式名称
+            
+        Returns:
+            Tuple[List[int], List[bool]]: (tokens, mode_mask)
+        """
+        tokens = []
+        mode_mask = self._create_mode_masks(notes, mode)
+        
+        for note, in_mode in zip(notes, mode_mask):
+            # 基本的音符tokens
+            note_tokens = [
+                self.vocab[f"Pitch_{self.NANYIN_PITCHES[note.pitch]}"],
+                self.vocab[f"Velocity_{note.velocity}"],
+                self.vocab[f"Duration_{note.duration // self.ticks_per_quarter}"]
+            ]
+            
+            # 如果是撚指，添加撚指标记
+            if self._detect_nianzhi([note]):  # 这里需要根据实际情况修改检测逻辑
+                note_tokens.append(self.vocab["Tech_Nianzhi"])
+            
+            tokens.extend(note_tokens)
+            
+        return tokens, mode_mask
+
+    def __call__(self, score: Score, mode: str = "G") -> Tuple[List[int], List[List[bool]]]:
+        """处理完整的乐谱，返回tokens和模式掩码
+        
+        Args:
+            score: 乐谱对象
+            mode: 默认调式
+            
+        Returns:
+            Tuple[List[int], List[List[bool]]]: (tokens, mode_masks)
+        """
+        all_tokens = []
+        all_mode_masks = []
+        
+        for track in score.tracks:
+            if not track.notes:
+                continue
+                
+            track_tokens, track_mask = self._tokenize_with_mode_mask(track.notes, mode)
+            all_tokens.extend(track_tokens)
+            all_mode_masks.append(track_mask)
+            
+        return all_tokens, all_mode_masks
+
+    def generate_with_mode_constraint(self, tokens: List[int], mode_masks: List[bool], temperature: float = 1.0):
+        """使用模式掩码约束的生成"""
+        generated = []  # 确保这行缩进是 4 个空格
+        is_nianzhi = False
+        nianzhi_tokens = []
+
+        for token, in_mode in zip(tokens, mode_masks):
+            token_str = self.vocab[token]
+
+            if token_str == "Tech_Nianzhi":
+                is_nianzhi = True
+                generated.append(token)
+            else:
+                if is_nianzhi:
+                    nianzhi_tokens.append(token)
+                    if token_str.startswith("Duration_"):
+                        is_nianzhi = False
+                        # 处理撚指音符
+                        generated.extend(nianzhi_tokens)
+                        nianzhi_tokens = []
+                else:
+                    generated.append(token)
+
+        return generated  # 确保 return 语句在方法内部并正确缩进
+
+    def tokenize(self, score: Score) -> Dict:
+        """将Score对象转换为tokens"""
+        tokens = []
+        mode_masks = []
+        
+        try:
+            print("开始tokenization过程...")
+            print(f"词汇表大小: {len(self.vocab)}")
+            
+            # 预处理音乐文件
+            self._preprocess_score(score)
+            
+            # 处理每个轨道
+            for track_idx, track in enumerate(score.tracks):
+                print(f"\n处理轨道 {track_idx}:")
+                print(f"音符数量: {len(track.notes)}")
+                if track.notes:
+                    print(f"第一个音符信息: 音高={track.notes[0].pitch}, 力度={track.notes[0].velocity}")
+                
+                if not track.notes:
+                    print(f"警告：轨道 {track_idx} 没有音符")
+                    continue
+                    
+                track_tokens, track_masks = self._tokenize_track(track)
+                print(f"轨道 {track_idx} tokenization结果:")
+                print(f"生成的token数量: {len(track_tokens)}")
+                
+                if track_tokens and track_masks:  # 只添加非空的结果
+                    tokens.extend(track_tokens)
+                    mode_masks.extend(track_masks)
+            
+            # 验证token序列
+            if not tokens:
+                print("警告：没有生成任何token，返回空结果")
+                return self._create_empty_result()
+            
+            # 构建结果字典
+            result = {
+                'token_sequence': tokens,
+                'mode_mask': mode_masks,
+                'tech_positions': self._get_tech_positions(tokens),
+                'tech_types': self._get_tech_types(tokens)
+            }
+            
+            print("\nTokenization完成")
+            print(f"技法位置数量: {len(result['tech_positions'])}")
+            
+            return result
+            
+        except Exception as e:
+            print(f"Tokenize出错: {str(e)}")
+            print("错误详细信息:", e.__class__.__name__)
+            import traceback
+            traceback.print_exc()
+            return self._create_empty_result()
+            
+    def _create_empty_result(self) -> Dict:
+        """创建空的结果字典"""
+        return {
+            'token_sequence': [],
+            'mode_mask': [],
+            'tech_positions': [],
+            'tech_types': []
+        }
+        
+    def _detect_nianzhi_pattern(self, tokens: List[int]) -> bool:
+        """检测是否为撚指模式"""
+        try:
+            if len(tokens) != 4:
+                return False
+                
+            # 获取token对应的字符串
+            token_strs = [self.vocab.get(t, "") for t in tokens]
+            
+            # 检查模式：音高 + 力度 + 短时值 + 技法标记
+            is_valid_pitch = token_strs[0].startswith("Pitch_")
+            is_valid_velocity = token_strs[1].startswith("Velocity_")
+            is_short_duration = (
+                token_strs[2].startswith("Duration_") and 
+                int(token_strs[2].split("_")[1]) < self.ticks_per_quarter // 2
+            )
+            is_tech_token = token_strs[3] == "Tech_Nianzhi"
+            
+            return all([is_valid_pitch, is_valid_velocity, is_short_duration, is_tech_token])
+            
+        except Exception as e:
+            print(f"检测撚指模式时出错: {str(e)}")
+            return False
+
+    def _tokenize_track(self, track: Track) -> Tuple[List[int], List[bool]]:
+        """将单个轨道转换为tokens序列"""
+        tokens = []
+        mode_masks = []
+        current_time = 0
+        notes_window = []  # 用于检测撚指的滑动窗口
+        
+        try:
+            # 过滤并排序有效音符
+            valid_notes = []
+            for note in sorted(track.notes, key=lambda x: x.start):
+                if (hasattr(note, 'pitch') and hasattr(note, 'velocity') and 
+                    hasattr(note, 'duration') and note.duration > 0):
+                    valid_notes.append(note)
+            
+            if not valid_notes:
+                print("警告：轨道中没有有效音符")
+                return [], []
+            
+            # 处理每个音符
+            for note in valid_notes:
+                # 更新滑动窗口
+                if not notes_window or note.pitch == notes_window[-1].pitch:
+                    notes_window.append(note)
+                else:
+                    # 如果音高不同，检查之前的窗口是否构成撚指
+                    if len(notes_window) >= 2 and self._detect_nianzhi(notes_window):
+                        # 添加撚指标记
+                        tech_token = self.vocab["Tech_Nianzhi"]
+                        tokens.append(tech_token)
+                        mode_masks.append(False)
+                    # 重置窗口
+                    notes_window = [note]
+                
+                # 1. 处理时间偏移
+                time_shift = note.start - current_time
+                if time_shift > 0:
+                    beats = time_shift / self.ticks_per_quarter
+                    quantized_beats = min(127, max(0, int(beats * self.beat_res[(0, 4)])))
+                    time_token = self.vocab.get(f"TimeShift_{quantized_beats}", self.vocab["TimeShift_0"])
+                    tokens.append(time_token)
+                    mode_masks.append(False)
+                current_time = note.start
+                
+                # 2. 处理音高
+                pitch_name = self.NANYIN_PITCHES.get(note.pitch, "UNK")
+                pitch_token = self.vocab.get(f"Pitch_{pitch_name}", self.vocab["Pitch_UNK"])
+                tokens.append(pitch_token)
+                mode_masks.append(True)
+                
+                # 3. 处理力度
+                velocity_bin = min(self.num_velocities - 1, 
+                                 max(0, int(note.velocity * self.num_velocities / 128)))
+                velocity_token = self.vocab.get(f"Velocity_{velocity_bin}", self.vocab["Velocity_0"])
+                tokens.append(velocity_token)
+                mode_masks.append(False)
+                
+                # 4. 处理持续时间
+                duration_beats = note.duration / self.ticks_per_quarter
+                quantized_duration = min(127, max(1, int(duration_beats * self.beat_res[(0, 4)])))
+                duration_token = self.vocab.get(f"Duration_{quantized_duration}", self.vocab["Duration_1"])
+                tokens.append(duration_token)
+                mode_masks.append(False)
+            
+            # 检查最后的窗口
+            if len(notes_window) >= 2 and self._detect_nianzhi(notes_window):
+                tech_token = self.vocab["Tech_Nianzhi"]
+                tokens.append(tech_token)
+                mode_masks.append(False)
+            
+            return tokens, mode_masks
+            
+        except Exception as e:
+            print(f"_tokenize_track出错: {str(e)}")
+            return [], []
+
+    def _get_tech_positions(self, tokens: List[int]) -> List[int]:
+        """获取技法位置"""
+        tech_positions = []
+        try:
+            # 创建反向映射
+            reverse_vocab = {v: k for k, v in self._vocab.items()}
+            
+            for i, token in enumerate(tokens):
+                if token in reverse_vocab and reverse_vocab[token] == "Tech_Nianzhi":
+                    tech_positions.append(i)
+        except Exception as e:
+            print(f"获取技法位置时出错: {str(e)}")
+        return tech_positions
+
+    def _get_tech_types(self, tokens: List[int]) -> List[str]:
+        """获取技法类型"""
+        tech_types = []
+        try:
+            # 创建反向映射
+            reverse_vocab = {v: k for k, v in self._vocab.items()}
+            
+            for token in tokens:
+                if token in reverse_vocab and reverse_vocab[token] == "Tech_Nianzhi":
+                    tech_types.append("nianzhi")
+        except Exception as e:
+            print(f"获取技法类型时出错: {str(e)}")
+        return tech_types
+
+
+    def _save_processed(self, processed: Dict, output_path: str) -> None:
+        """保存处理后的数据
+        Args:
+            processed: 处理后的数据
+            output_path: 输出文件路径
+        """
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # 将数据转换为可序列化的格式
+        serializable_data = {
+            'token_sequence': processed['token_sequence'],
+            'mode_mask': processed['mode_mask'],
+            'tech_positions': processed['tech_positions'],
+            'tech_types': processed['tech_types']
+        }
+        
+        # 保存为JSON文件
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(serializable_data, f, ensure_ascii=False, indent=2)
+
+    def _preprocess_score(self, score: Score) -> None:
+        """预处理Score对象
+        Args:
+            score: Score对象
+        """
+        # 1. 时间量化
+        self._quantize_time(score)
+        
+        # 2. 量化力度和速度
+        self._quantize_velocities_and_tempos(score)
+
+    def _quantize_time(self, score: Score) -> None:
+        """量化时间
+        Args:
+            score: Score对象
+        """
+        ticks_per_beat = score.ticks_per_quarter
+        for track in score.tracks:
+            for note in track.notes:
+                # 量化开始时间
+                note.start = int(round(note.start / ticks_per_beat) * ticks_per_beat)
+                # 量化持续时间
+                note.duration = int(round(note.duration / ticks_per_beat) * ticks_per_beat)
+
+
+    def _quantize_velocities_and_tempos(self, score: Score) -> None:
+        """量化力度和速度
+        Args:
+            score: Score对象
+        """
+        # 量化力度
+        for track in score.tracks:
+            for note in track.notes:
+                note.velocity = int(note.velocity * self.num_velocities / 128)
+        
+        # 量化速度
+        if hasattr(score, 'tempos'):
+            for tempo in score.tempos:
+                tempo.tempo = int(round(tempo.tempo / 5) * 5)  # 量化到最接近的5
+
+    
+
+    def process_file(self, input_path: str, output_path: str) -> None:
+        """处理单个MIDI文件"""
+        try:
+            # 检查文件是否存在
+            if not os.path.isfile(input_path):
+                print(f"文件不存在: {input_path}")
+                return
+                
+            # 读取MIDI文件
+            score = Score(input_path)
+            
+            # 预处理音乐文件
+            self._preprocess_score(score)
+            
+            # 处理并获取token数据
+            processed = self.tokenize(score)
+            
+            # 验证数据格式
+            if not isinstance(processed, dict):
+                raise ValueError(f"处理结果必须是字典格式，而不是 {type(processed)}")
+            
+            if not isinstance(processed.get('token_sequence', None), list):
+                raise ValueError("token_sequence 必须是列表格式")
+            
+            # 保存处理后的数据
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(processed, f, ensure_ascii=False, indent=2)
+            
+        except Exception as e:
+            print(f"处理文件 {input_path} 时出错: {str(e)}")
+            # 保存最小有效数据
+            minimal_data = {
+                'token_sequence': [],
+                'mode_mask': [],
+                'tech_positions': [],
+                'tech_types': []
+            }
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(minimal_data, f, ensure_ascii=False, indent=2)
+
+    def process_directory(self, input_dir: str, output_dir: str) -> None:
+        """处理目录中的所有MIDI文件
+        Args:
+            input_dir: 输入目录路径
+            output_dir: 输出目录路径
+        """
+        import os
+        from pathlib import Path
+        from tqdm import tqdm
+        
+        # 创建输出目录
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"开始处理MIDI文件，输入目录：{input_dir}，输出目录：{output_dir}")
+        
+        # 获取所有MIDI文件（只处理当前目录下的文件，不递归）
+        input_path = Path(input_dir)
+        midi_files = list(input_path.glob("*.mid")) + list(input_path.glob("*.midi"))
+        print(f"找到 {len(midi_files)} 个MIDI文件")
+        
+        processed_count = 0
+        error_count = 0
+        
+        for midi_path in tqdm(midi_files, desc="处理MIDI文件"):
+            try:
+                # 生成输出文件路径
+                output_path = Path(output_dir) / midi_path.name.replace('.mid', '.tok').replace('.midi', '.tok')
+                
+                # 处理文件
+                self.process_file(str(midi_path), str(output_path))
+                processed_count += 1
+                
+            except Exception as e:
+                error_count += 1
+                print(f"处理文件 {midi_path} 时出错: {str(e)}")
+                continue
+        
+        print(f"\n处理完成：")
+        print(f"成功处理：{processed_count} 个文件")
+        print(f"处理失败：{error_count} 个文件")
+        print(f"处理后的文件保存在：{output_dir}")
