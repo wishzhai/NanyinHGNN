@@ -1,4 +1,3 @@
-# NanyinHGNN
 # 🎵 NanyinHGNN
 
 **Oral Tradition-Encoded NanyinHGNN: Integrating Nanyin Music Preservation and Generation through a Pipa-Centric Dataset**  
